@@ -1,0 +1,4 @@
+bin/
+logs/
+*.o
+.DS_Store
