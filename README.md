@@ -37,7 +37,25 @@ make run-demo ARGS="--list"       # discover + verify commissioning, no motion
 make run-demo ARGS="100 5"        # 100 rpm for 5 s on every controller (asks for RUN)
 ```
 
-`NANOLIB_DIR` defaults to `../vendor/nanolib`. Override it, or `NANOLIB_INC` / `NANOLIB_LIB`, if the SDK lives elsewhere. Close Plug & Drive Studio before running: only one process may own a controller.
+`NANOLIB_DIR` defaults to `../vendor/nanolib`, with headers in `inc/` and libraries in `lib/`. Override it, or `NANOLIB_INC` / `NANOLIB_LIB`, if the SDK lives elsewhere. Close Plug & Drive Studio before running: only one process may own a controller.
+
+## Real SDK build
+
+Download [NanoLib C++ 1.4.3](https://www.nanotec.com/fileadmin/files/Software/NanoLib/NanoLib_cpp_1.4.3.zip) from the [official NanoLib page](https://www.nanotec.com/us/en/products/9985-nanolib). Extract the outer ZIP, then `nanolib_cpp_linux_1.4.3.zip` for Linux x86_64. Its `nanotec_nanolib/` directory contains `inc/` and `lib/`; place that directory at `../vendor/nanolib`, or point `NANOLIB_DIR` at it. Keep all supplied libraries together, including `libnanolibm_usbmsc.so`, which is a runtime communication module. Do not commit the proprietary SDK.
+
+The wrapper includes these real SDK headers: `accessor_factory.hpp`, `bus_hardware_options.hpp`, `nano_lib_accessor.hpp`, `nano_lib_hw_strings.hpp`, `nlc_callback.hpp`, `nlc_log_level.hpp`, and `od_index.hpp`. The SDK's bundled example has a separate `NanolibExample/nanolib/include/` copy; the standalone distribution uses `nanotec_nanolib/inc/`.
+
+```bash
+# macOS or Linux: syntax-check against the real headers without linking/running SDK code
+make check-nanolib NANOLIB_CHECK_INC=/path/to/nanotec_nanolib/inc
+
+# Linux x86_64: compile and link the demo, without running it
+make -B demo CXX=g++-13 NANOLIB_DIR=/path/to/nanotec_nanolib
+```
+
+The default `make check-nanolib` uses an independently written compile-only API subset in `tests/nanolib_stubs`. It does not prove SDK ABI or runtime compatibility. Use the real-header command above and a Linux link build when updating the integration.
+
+Build verification on 2026-10-26 used SDK 1.4.3: Apple clang 17 on macOS arm64 passed the real-header syntax check, and Ubuntu 24.04 linux/amd64 with g++ 13.3.0 compiled and linked the C++17 demo. ELF inspection confirmed `libnanolib.so` as a required shared library. The demo and SDK binaries were not run; hardware behavior remains unverified.
 
 ## Safety behavior
 
@@ -51,4 +69,3 @@ make run-demo ARGS="100 5"        # 100 rpm for 5 s on every controller (asks fo
 
 - How NanoLib reports two controllers (two USB buses vs. one bus with two devices). `discover()` handles both; check the `--list` output.
 - Negative velocity writes. The value is passed to `writeNumber` as a signed 32-bit integer. Test at low speed first.
-- Header location inside the NanoLib SDK (`NANOLIB_INC`).

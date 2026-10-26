@@ -2,3 +2,8 @@ bin/
 logs/
 *.o
 .DS_Store
+# Proprietary SDK, if placed inside this checkout instead of ../vendor/nanolib.
+/vendor/
+/nanotec_nanolib/
+/NanoLib*.zip
+/nanolib*.zip

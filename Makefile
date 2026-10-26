@@ -5,14 +5,15 @@
 #   make demo            build bin/motor_demo against the real NanoLib SDK (Linux x86_64)
 #   make run-demo ARGS="100 5"
 #
-# Point NANOLIB_DIR at the SDK if it lives elsewhere; adjust NANOLIB_INC if the
-# headers are not in $(NANOLIB_DIR)/include.
+# Point NANOLIB_DIR at the extracted nanotec_nanolib directory (inc/ and lib/).
+# NANOLIB_CHECK_INC can select real SDK headers for the compile-only check.
 
 CXX ?= g++
 CXXFLAGS ?= -std=c++17 -O2 -Wall -Wextra -Wpedantic
 NANOLIB_DIR ?= ../vendor/nanolib
-NANOLIB_INC ?= $(NANOLIB_DIR)/include
+NANOLIB_INC ?= $(NANOLIB_DIR)/inc
 NANOLIB_LIB ?= $(NANOLIB_DIR)/lib
+NANOLIB_CHECK_INC ?= tests/nanolib_stubs
 
 INCLUDES := -Iinclude
 BIN := bin
@@ -31,7 +32,7 @@ test: $(BIN)/motor_tests
 	./$(BIN)/motor_tests
 
 check-nanolib:
-	$(CXX) $(CXXFLAGS) $(INCLUDES) -Itests/nanolib_stubs -fsyntax-only src/nanolib_session.cpp examples/motor_demo.cpp
+	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(NANOLIB_CHECK_INC) -fsyntax-only src/nanolib_session.cpp examples/motor_demo.cpp
 
 $(BIN)/motor_demo: examples/motor_demo.cpp src/motor.cpp src/nanolib_session.cpp include/motor/*.hpp | $(BIN)
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(NANOLIB_INC) examples/motor_demo.cpp src/motor.cpp src/nanolib_session.cpp \

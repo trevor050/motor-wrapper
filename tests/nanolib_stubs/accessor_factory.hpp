@@ -1,2 +1,4 @@
 #pragma once
 #include "nano_lib_accessor.hpp"
+
+extern "C" nlc::NanoLibAccessor* getNanoLibAccessor();

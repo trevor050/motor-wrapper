@@ -1,52 +1,73 @@
 #pragma once
-// Compile-only stand-ins for the NanoLib 1.4.3 headers, written from the
-// signatures in the NanoLib C++ User Manual V1.4.5. Used by `make check-nanolib`
-// to type-check src/nanolib_session.cpp on machines without the SDK.
-// Never link against these; the real SDK headers take precedence on the robot.
+// Independently written compile-only subset, checked against the official
+// NanoLib C++ Linux x86_64 SDK 1.4.3 on 2026-10-26. These declarations model
+// only the API used by this wrapper, not the complete SDK or its ABI.
+// Never link against these. Use real headers and libraries for `make demo`.
 #include <cstdint>
 #include <string>
 #include <vector>
 
 namespace nlc {
 
-enum class LogLevel { Trace, Debug, Info, Warn, Error, Off };
-enum class BusScanInfo { Start, Progress, Finished };
+enum class LogLevel : unsigned int { Trace, Debug, Info, Warning, Error, Critical, Off, n_levels };
+enum class BusScanInfo { Start, Progress, FoundDevice, Finished };
 
 class Result {
 public:
-    bool hasError() const { return !error_.empty(); }
-    const std::string getError() const { return error_; }
-protected:
-    std::string error_;
+    Result();
+    virtual ~Result() = 0;
+    bool hasError() const;
+    const std::string getError() const;
 };
-class ResultVoid : public Result {};
-class ResultInt : public Result { public: int64_t getResult() const { return 0; } };
-class ResultString : public Result { public: std::string getResult() const { return {}; } };
+class ResultVoid : public Result { public: ResultVoid(); };
+class ResultInt : public Result {
+public:
+    ResultInt(int64_t);
+    int64_t getResult() const;
+};
+class ResultString : public Result {
+public:
+    ResultString(const std::string&, bool);
+    const std::string getResult() const;
+};
 
 class BusHardwareId {
 public:
-    std::string getProtocol() const { return {}; }
-    std::string toString() const { return {}; }
+    virtual ~BusHardwareId() = default;
+    std::string getProtocol() const;
+    std::string toString() const;
 };
 class BusHardwareOptions {};
 class DeviceId {
 public:
-    std::string toString() const { return {}; }
+    std::string toString() const;
 };
-class DeviceHandle {
+struct DeviceHandle {
+    DeviceHandle();
+    DeviceHandle(uint32_t);
+    bool equals(DeviceHandle) const;
+    std::string toString() const;
+    uint32_t get() const;
+};
+class ResultBusHwIds : public Result {
 public:
-    DeviceHandle(const DeviceHandle&) = default;
-private:
-    DeviceHandle() = default;
-    friend class ResultDeviceHandle;
+    ResultBusHwIds(const std::vector<BusHardwareId>&);
+    const std::vector<BusHardwareId> getResult() const;
 };
-class ResultBusHwIds : public Result { public: std::vector<BusHardwareId> getResult() const { return {}; } };
-class ResultDeviceIds : public Result { public: std::vector<DeviceId> getResult() const { return {}; } };
-class ResultDeviceHandle : public Result { public: DeviceHandle getResult() const { return DeviceHandle(); } };
+class ResultDeviceIds : public Result {
+public:
+    ResultDeviceIds(const std::vector<DeviceId>&);
+    const std::vector<DeviceId> getResult() const;
+};
+class ResultDeviceHandle : public Result {
+public:
+    ResultDeviceHandle(const DeviceHandle&);
+    DeviceHandle getResult() const;
+};
 
-class OdIndex {
-public:
-    OdIndex(uint16_t, uint8_t) {}
+struct OdIndex {
+    OdIndex();
+    OdIndex(uint16_t, uint8_t);
 };
 
 class NlcScanBusCallback {
@@ -72,8 +93,4 @@ public:
     virtual void setLoggingLevel(LogLevel level) = 0;
 };
 
-inline const std::string BUS_HARDWARE_ID_PROTOCOL_MSC = "MSC";
-
 } // namespace nlc
-
-nlc::NanoLibAccessor* getNanoLibAccessor();

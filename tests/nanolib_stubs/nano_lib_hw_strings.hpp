@@ -1,2 +1,5 @@
 #pragma once
-#include "nano_lib_accessor.hpp"
+
+namespace nlc {
+constexpr char BUS_HARDWARE_ID_PROTOCOL_MSC[] = "MSC";
+} // namespace nlc
