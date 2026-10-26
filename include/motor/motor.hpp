@@ -28,7 +28,7 @@ DriveState decodeState(uint16_t statusword);
 const char* toString(DriveState state);
 
 // Bench limits enforced by verifyCommissioning() and setVelocityRpm().
-// Defaults match the agreed velocity_test.cpp bench setup.
+// Defaults match the team's agreed bench setup: unloaded direct-drive motor, 24 V / 3 A supply.
 struct SafetyLimits {
     int maxRpm = 350;
     int64_t maxCurrentMilliamps = 3000;   // 0x2031 and 0x6075
