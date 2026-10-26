@@ -60,8 +60,11 @@ Build verification on 2026-10-26 used SDK 1.4.3: Apple clang 17 on macOS arm64 p
 ## Safety behavior
 
 - `enable()` refuses to run until `verifyCommissioning()` passes. The checks match `velocity_test.cpp`: encoder velocity feedback, Hall or encoder commutation, rpm units, 1:1 factors, current ≤ 3 A, ramps 25–100 rpm/s, no NanoJ running. Adjust `SafetyLimits` rather than removing checks.
+- `setCancelCheck()` lets a Ctrl+C flag abort `enable()` before any further write; the motor is then stopped and disabled.
 - Any failure during `enable()` triggers stop and disable before the exception propagates.
-- `checkHealthy()` shuts the motor down before throwing.
+- `checkHealthy()` validates both selected velocity (`0x606C`) and encoder velocity (`0x60E5:03`) for overspeed and for motion against the ramp demand. On a trip it zeroes the target immediately, refuses new targets, and throws. The blocking wait and disable happen in `stopAndDisable()` / `shutdownAll()`.
+- `stop()` always re-reads velocity; a disabled but coasting motor is not reported as stopped.
+- With several motors, use `shutdownAll()` (the demo's `MotorGroup` does this): every target is zeroed first, then all motors are awaited against one deadline, then all are disabled, even if one fails.
 - The `Motor` destructor stops and disables a motor that is still enabled.
 - **Known hazard:** if the process is killed (`kill -9`, crash) or USB disconnects, the controller keeps running at its last target velocity. Software cannot prevent this over USB. Keep a hardware stop within reach.
 

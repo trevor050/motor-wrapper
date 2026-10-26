@@ -2,8 +2,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "motor/od_io.hpp"
 
@@ -69,6 +71,9 @@ struct Telemetry {
 //   ... poll motor.telemetry() / motor.checkHealthy() ...
 //   motor.stopAndDisable();
 //
+// For several motors, use shutdownAll() so every motor is commanded to zero
+// before waiting on any of them.
+//
 // The destructor makes a best-effort stop and disable. No software cleanup can
 // stop the motor if the process is killed or USB is lost; keep a hardware stop.
 class Motor {
@@ -87,6 +92,10 @@ public:
     // MotorError naming the first problem. enable() requires a passing check.
     void verifyCommissioning();
 
+    // Optional cancellation (for example a Ctrl+C flag). enable() checks it
+    // before every write and while waiting, and aborts into shutdown.
+    void setCancelCheck(std::function<bool()> cancelled) { cancelled_ = std::move(cancelled); }
+
     // Enters Profile Velocity mode with a zero target and walks the drive to
     // Operation enabled. Requires Switch on disabled without a fault.
     void enable();
@@ -94,8 +103,15 @@ public:
     // Signed target velocity. Requires enable(). Rejects |rpm| above the limit.
     void setVelocityRpm(int rpm);
 
-    // Commands zero velocity and waits until the drive reports standstill.
-    // Returns false if standstill was not confirmed before the timeout.
+    // Writes a zero target velocity without waiting.
+    void commandZero();
+
+    // Polls until selected velocity, encoder velocity, and demand all read zero
+    // (within Timing::stationaryRpm) for Timing::stationarySamples polls.
+    bool waitForStandstill(std::chrono::steady_clock::time_point deadline);
+
+    // commandZero() then waitForStandstill(). Returns false if standstill was
+    // not confirmed before Timing::stopTimeout.
     bool stop();
 
     // Disables the power stage and confirms Switch on disabled.
@@ -109,10 +125,16 @@ public:
 
     DriveState state();
     bool isEnabled() const { return enabled_; }
+    // True once any enable write was sent, until disable is confirmed.
+    bool needsShutdown() const { return controlAttempted_; }
+    const Timing& timing() const { return timing_; }
     Telemetry telemetry();
 
     // Throws if the drive faulted, left Operation enabled, changed mode, reports
-    // an error, or exceeds the overspeed limit. Call this in every control loop.
+    // an error, exceeds the overspeed limit, or moves against the ramp demand
+    // (selected and encoder velocity are both checked). On failure it commands
+    // zero immediately, refuses further setVelocityRpm() calls, and throws; the
+    // caller then runs stopAndDisable() or shutdownAll(). Call it every loop.
     void checkHealthy();
 
 private:
@@ -122,6 +144,7 @@ private:
     uint16_t statusword();
     void controlword(uint16_t value);
     void waitForState(DriveState expected);
+    void throwIfCancelled(const char* step);
     void bestEffortShutdown() noexcept;
 
     std::unique_ptr<OdIo> io_;
@@ -131,8 +154,13 @@ private:
     bool commissioningVerified_ = false;
     bool controlAttempted_ = false; // any enable write sent; cleanup required
     bool enabled_ = false;          // reached Operation enabled
-    int lastTargetRpm_ = 0;
     int64_t profileVelocityLimitRpm_ = 0;
+    std::function<bool()> cancelled_;
 };
+
+// Coordinated shutdown: commands zero on every motor first, then waits for
+// standstill on all of them against one shared deadline, then disables each.
+// Every motor is attempted even if another one fails. Never throws.
+void shutdownAll(const std::vector<Motor*>& motors) noexcept;
 
 } // namespace motor

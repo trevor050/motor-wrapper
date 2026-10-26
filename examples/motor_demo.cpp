@@ -18,6 +18,28 @@ namespace {
 
 volatile std::sig_atomic_t keepRunning = 1;
 
+// Shuts every motor down together, however the scope is left.
+class MotorGroup {
+public:
+    ~MotorGroup() { shutdown(); }
+
+    void add(std::unique_ptr<motor::Motor> m) { motors_.push_back(std::move(m)); }
+    std::vector<std::unique_ptr<motor::Motor>>& all() { return motors_; }
+
+    void shutdown() noexcept {
+        std::vector<motor::Motor*> raw;
+        for (auto& m : motors_) raw.push_back(m.get());
+        motor::shutdownAll(raw);
+    }
+
+private:
+    std::vector<std::unique_ptr<motor::Motor>> motors_;
+};
+
+void requireRunning(const char* step) {
+    if (!keepRunning) throw motor::MotorError(std::string("Interrupted before ") + step + ".");
+}
+
 } // namespace
 
 int main(int argc, char** argv) {
@@ -39,18 +61,19 @@ int main(int argc, char** argv) {
             std::cout << '[' << c.index << "] " << c.device << "  on  " << c.bus << '\n';
         }
 
-        // Motors are declared after the session so they are destroyed first.
-        std::vector<std::unique_ptr<motor::Motor>> motors;
+        // Declared after the session so motors are shut down and released first.
+        MotorGroup group;
         for (const auto& c : controllers) {
-            motors.push_back(session.connectMotor(c.index, "motor" + std::to_string(c.index)));
-            auto& m = *motors.back();
+            group.add(session.connectMotor(c.index, "motor" + std::to_string(c.index)));
+            auto& m = *group.all().back();
+            m.setCancelCheck([] { return !keepRunning; });
             std::cout << m.name() << " firmware " << m.firmwareVersion() << '\n';
             m.verifyCommissioning();
             std::cout << m.name() << " commissioning OK\n";
         }
         if (listOnly) return 0;
 
-        std::cout << "Spin " << motors.size() << " motor(s) at " << rpm << " rpm for " << seconds
+        std::cout << "Spin " << group.all().size() << " motor(s) at " << rpm << " rpm for " << seconds
                   << " s. Motors unloaded and secured, hardware stop ready. Type RUN: ";
         std::string confirmation;
         if (!(std::cin >> confirmation) || confirmation != "RUN") {
@@ -58,12 +81,19 @@ int main(int argc, char** argv) {
             return 0;
         }
 
-        for (auto& m : motors) m->enable();
-        for (auto& m : motors) m->setVelocityRpm(rpm);
+        // Enable all at zero speed first, then command speed only if nothing was interrupted.
+        for (auto& m : group.all()) {
+            requireRunning("enable");
+            m->enable();
+        }
+        for (auto& m : group.all()) {
+            requireRunning("setting the target velocity");
+            m->setVelocityRpm(rpm);
+        }
 
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
         while (keepRunning && std::chrono::steady_clock::now() < deadline) {
-            for (auto& m : motors) {
+            for (auto& m : group.all()) {
                 m->checkHealthy();
                 const auto t = m->telemetry();
                 std::cout << m->name() << ": demand=" << t.demandRpm << " actual=" << t.actualRpm
@@ -74,11 +104,17 @@ int main(int argc, char** argv) {
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
 
-        for (auto& m : motors) m->stopAndDisable();
+        group.shutdown();
+        for (auto& m : group.all()) {
+            if (m->needsShutdown()) {
+                std::cerr << m->name() << " was NOT confirmed disabled. Use the hardware stop.\n";
+                return 1;
+            }
+        }
         std::cout << "Stopped and disabled.\n";
         return 0;
     } catch (const std::exception& error) {
-        // Motor destructors stop and disable anything still enabled.
+        // MotorGroup's destructor has already zeroed and disabled every motor.
         std::cerr << "Error: " << error.what() << '\n';
         return 1;
     }

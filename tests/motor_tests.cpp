@@ -1,6 +1,8 @@
 // Hardware-free tests for motor::Motor against the simulated drive.
 // Build and run with `make test`; no NanoLib installation required.
 
+#include <algorithm>
+#include <climits>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -43,7 +45,7 @@ motor::Timing fastTiming() {
     motor::Timing timing;
     timing.pollInterval = std::chrono::milliseconds(1);
     timing.stateTimeout = std::chrono::milliseconds(30);
-    timing.stopTimeout = std::chrono::milliseconds(30);
+    timing.stopTimeout = std::chrono::milliseconds(200);
     return timing;
 }
 
@@ -122,7 +124,7 @@ const std::vector<std::pair<std::string, std::function<void()>>> tests = {
          check(throwsMotorError([&] { m->setVelocityRpm(100); }, "enable()"), "set before enable");
          m->enable();
          m->setVelocityRpm(100);
-         check(state.od[{0x606C, 0}] == 100, "drive spinning at 100");
+         check(m->telemetry().actualRpm == 100, "drive spinning at 100");
          m->setVelocityRpm(-100);
          check(m->telemetry().actualRpm == -100, "negative velocity decoded as signed");
          check(throwsMotorError([&] { m->setVelocityRpm(351); }, "limit"), "rejects 351 rpm");
@@ -175,7 +177,7 @@ const std::vector<std::pair<std::string, std::function<void()>>> tests = {
          auto m = makeMotor(state);
          m->verifyCommissioning();
          m->enable();
-         state.reverseVelocity = -120;
+         state.velocityOverride = -120;
          m->setVelocityRpm(100);
          check(throwsMotorError([&] { m->checkHealthy(); }, "opposite"), "direction check");
          check(!m->isEnabled(), "shut down after failed health check");
@@ -185,7 +187,7 @@ const std::vector<std::pair<std::string, std::function<void()>>> tests = {
          auto m = makeMotor(state);
          m->verifyCommissioning();
          m->enable();
-         state.reverseVelocity = 500;
+         state.velocityOverride = 500;
          m->setVelocityRpm(300);
          check(throwsMotorError([&] { m->checkHealthy(); }, "overspeed"), "overspeed check");
      }},
@@ -196,6 +198,125 @@ const std::vector<std::pair<std::string, std::function<void()>>> tests = {
          m->enable();
          state.failReads = true;
          check(throwsMotorError([&] { m->checkHealthy(); }, "USB"), "comm loss surfaces");
+     }},
+    {"health check uses encoder velocity independently", [] {
+         auto state = commissioned();
+         auto m = makeMotor(state);
+         m->verifyCommissioning();
+         m->enable();
+         m->setVelocityRpm(100);
+         state.encoderOverride = 500;
+         check(throwsMotorError([&] { m->checkHealthy(); }, "overspeed"), "encoder overspeed");
+         auto m2State = commissioned();
+         auto m2 = makeMotor(m2State);
+         m2->verifyCommissioning();
+         m2->enable();
+         m2->setVelocityRpm(100);
+         m2State.encoderOverride = -120;
+         check(throwsMotorError([&] { m2->checkHealthy(); }, "opposite"), "encoder direction");
+     }},
+    {"health check trip zeroes target without blocking", [] {
+         auto state = commissioned();
+         auto m = makeMotor(state);
+         m->verifyCommissioning();
+         m->enable();
+         m->setVelocityRpm(200);
+         state.velocityOverride = 500;
+         check(throwsMotorError([&] { m->checkHealthy(); }, "overspeed"), "trips");
+         check(state.od[{0x60FF, 0}] == 0, "target zeroed on trip");
+         check(throwsMotorError([&] { m->setVelocityRpm(50); }, "enable()"), "no new targets after trip");
+         check(m->needsShutdown(), "still needs shutdown");
+     }},
+    {"INT32_MIN feedback is never treated as safe", [] {
+         auto state = commissioned();
+         auto m = makeMotor(state);
+         m->verifyCommissioning();
+         m->enable();
+         state.velocityOverride = INT32_MIN;
+         check(throwsMotorError([&] { m->checkHealthy(); }, "overspeed"), "health check rejects INT32_MIN");
+         check(!m->stop(), "stop does not report standstill at INT32_MIN");
+         check(throwsMotorError([&] { m->setVelocityRpm(INT_MIN); }), "INT_MIN target rejected");
+     }},
+    {"stop confirms standstill even after disable while coasting", [] {
+         auto state = commissioned();
+         state.rampStepRpm = 20;
+         auto m = makeMotor(state);
+         m->verifyCommissioning();
+         m->enable();
+         m->setVelocityRpm(200);
+         for (int i = 0; i < 30; ++i) m->telemetry();
+         check(state.velocity == 200, "spun up");
+         state.velocityOverride = 200; // keeps coasting after disable
+         m->disable();
+         check(!m->stop(), "stop must not claim standstill while coasting");
+         state.velocityOverride.reset();
+         check(m->stop(), "standstill confirmed once coasted down");
+         check(state.velocity == 0, "velocity really zero");
+     }},
+    {"reversal through zero does not trip the direction check", [] {
+         auto state = commissioned();
+         state.rampStepRpm = 5;
+         auto m = makeMotor(state);
+         m->verifyCommissioning();
+         m->enable();
+         m->setVelocityRpm(100);
+         for (int i = 0; i < 100; ++i) m->checkHealthy();
+         check(state.velocity == 100, "at +100");
+         m->setVelocityRpm(-100);
+         for (int i = 0; i < 200 && state.velocity != -100; ++i) m->checkHealthy();
+         check(state.velocity == -100, "reached -100 with no trip");
+     }},
+    {"delayed rising-edge fault reset", [] {
+         auto state = commissioned();
+         state.faultOnEnable = true;
+         state.resetDelayReads = 3;
+         auto m = makeMotor(state);
+         m->verifyCommissioning();
+         check(throwsMotorError([&] { m->enable(); }, "fault"), "enable faults");
+         m->resetFault();
+         check(m->state() == DriveState::SwitchOnDisabled, "reset completed after delay");
+         check(controlwords(state).back() == 0, "bit 7 released");
+     }},
+    {"cancellation during enable aborts before Operation enabled", [] {
+         auto state = commissioned();
+         auto m = makeMotor(state);
+         m->verifyCommissioning();
+         int calls = 0;
+         m->setCancelCheck([&] { return ++calls > 3; });
+         check(throwsMotorError([&] { m->enable(); }, "cancelled"), "enable cancelled");
+         const auto cws = controlwords(state);
+         check(std::find(cws.begin(), cws.end(), 0x0F) == cws.end(), "never sent Enable operation");
+         check(m->state() == DriveState::SwitchOnDisabled, "left disabled");
+         check(!m->needsShutdown(), "cleanup completed");
+     }},
+    {"shutdownAll zeroes every motor before waiting on any", [] {
+         std::vector<std::string> journal;
+         auto a = commissioned();
+         auto b = commissioned();
+         a.name = "A";
+         b.name = "B";
+         a.journal = &journal;
+         b.journal = &journal;
+         a.rampStepRpm = b.rampStepRpm = 10;
+         auto ma = makeMotor(a);
+         auto mb = makeMotor(b);
+         for (auto* m : {ma.get(), mb.get()}) {
+             m->verifyCommissioning();
+             m->enable();
+             m->setVelocityRpm(150);
+         }
+         for (int i = 0; i < 40; ++i) {
+             ma->telemetry();
+             mb->telemetry();
+         }
+         journal.clear();
+         motor::shutdownAll({ma.get(), mb.get()});
+         check(journal.size() >= 4, "zero + disable for both");
+         check(journal.size() >= 2 && journal[0] == "A:60FF=0" && journal[1] == "B:60FF=0",
+               "both targets zeroed first");
+         check(a.velocity == 0 && b.velocity == 0, "both stopped");
+         check(ma->state() == DriveState::SwitchOnDisabled && mb->state() == DriveState::SwitchOnDisabled,
+               "both disabled");
      }},
 };
 

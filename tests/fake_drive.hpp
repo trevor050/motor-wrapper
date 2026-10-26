@@ -1,11 +1,15 @@
 #pragma once
 
 // Simulated C5-E for testing Motor without hardware. It models the CiA 402
-// state machine, Profile Velocity mode, and a correctly commissioned bench
-// configuration. Tests modify `od` or the fault flags to inject problems.
+// state machine, Profile Velocity mode with optional ramping and coasting,
+// rising-edge fault reset, and a correctly commissioned bench configuration.
+// Tests modify `od` or the injection fields to create problems.
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <map>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -17,10 +21,27 @@ namespace motor::testing {
 struct FakeDriveState {
     std::map<std::pair<uint16_t, uint8_t>, int64_t> od;
     std::vector<std::pair<uint16_t, int64_t>> writes; // (index, value) in order
+
+    // Fault injection.
     bool faultOnEnable = false;
     bool ignoreControlword = false;
     bool failReads = false;
-    int64_t reverseVelocity = 0; // nonzero: report this velocity regardless of target
+    int resetDelayReads = 0;                 // statusword reads before a reset completes
+    std::optional<int64_t> velocityOverride; // reported by 0x606C and both feedbacks
+    std::optional<int64_t> encoderOverride;  // reported by 0x60E5:03 only
+
+    // Dynamics. 0 = velocity follows demand instantly.
+    int64_t rampStepRpm = 0; // change per simulated tick (one tick per read)
+
+    // Shared write journal for multi-drive ordering tests ("name:index=value").
+    std::string name = "fake";
+    std::vector<std::string>* journal = nullptr;
+
+    // Simulation internals.
+    int64_t demand = 0;
+    int64_t velocity = 0;
+    uint16_t lastControlword = 0;
+    int pendingResetReads = -1;
 };
 
 class FakeDrive final : public OdIo {
@@ -72,6 +93,8 @@ public:
 
     int64_t readNumber(uint16_t index, uint8_t sub) override {
         if (s_.failReads) throw MotorError("simulated USB loss");
+        tick();
+        if (index == 0x6041) advanceReset();
         const auto it = s_.od.find({index, sub});
         if (it == s_.od.end()) throw MotorError("simulated: object does not exist");
         return it->second;
@@ -85,35 +108,70 @@ public:
     void writeNumber(uint16_t index, uint8_t sub, int64_t value, unsigned bits) override {
         if (s_.failReads) throw MotorError("simulated USB loss");
         s_.writes.push_back({index, value});
+        if (s_.journal) {
+            char entry[64];
+            std::snprintf(entry, sizeof entry, "%s:%04X=%lld", s_.name.c_str(), index, static_cast<long long>(value));
+            s_.journal->push_back(entry);
+        }
         // Real NanoLib stores the bits; mimic two's complement truncation.
-        const int64_t stored = bits == 32 ? int64_t(uint32_t(int32_t(value))) : value;
-        s_.od[{index, sub}] = stored;
+        s_.od[{index, sub}] = bits == 32 ? raw32(value) : value;
         if (index == 0x6060) s_.od[{0x6061, 0}] = value;
-        if (index == 0x60FF) updateVelocity();
-        if (index == 0x6040) applyControlword(uint16_t(value));
+        if (index == 0x6040) applyControlword(static_cast<uint16_t>(value));
+        publish();
     }
 
-    std::string describe() const override { return "fake-drive"; }
+    std::string describe() const override { return s_.name; }
 
 private:
-    void updateVelocity() {
-        const bool enabled = (s_.od[{0x6041, 0}] & 0x6F) == 0x27;
-        const int64_t target = enabled ? s_.od[{0x60FF, 0}] : 0;
-        const int64_t velocity = s_.reverseVelocity ? int64_t(uint32_t(int32_t(s_.reverseVelocity))) : target;
-        s_.od[{0x606B, 0}] = target;
-        s_.od[{0x606C, 0}] = velocity;
-        s_.od[{0x60E5, 3}] = velocity;
-        s_.od[{0x60E5, 2}] = velocity;
+    static int64_t raw32(int64_t value) { return int64_t(uint32_t(int32_t(value))); }
+    static int64_t signed32(int64_t raw) { return int32_t(uint32_t(raw)); }
+
+    bool operationEnabled() const { return (s_.od.at({0x6041, 0}) & 0x6F) == 0x27; }
+
+    static int64_t approach(int64_t from, int64_t to, int64_t step) {
+        if (step <= 0) return to;
+        if (from < to) return std::min(from + step, to);
+        return std::max(from - step, to);
+    }
+
+    void tick() {
+        const int64_t target = signed32(s_.od[{0x60FF, 0}]);
+        if (operationEnabled()) {
+            s_.demand = approach(s_.demand, target, s_.rampStepRpm);
+            s_.velocity = approach(s_.velocity, s_.demand, s_.rampStepRpm);
+        } else {
+            // Power stage off: no demand, the rotor coasts down.
+            s_.demand = 0;
+            s_.velocity = approach(s_.velocity, 0, s_.rampStepRpm);
+        }
+        publish();
+    }
+
+    void publish() {
+        const int64_t selected = s_.velocityOverride.value_or(s_.velocity);
+        const int64_t encoder = s_.encoderOverride.value_or(selected);
+        s_.od[{0x606B, 0}] = raw32(s_.demand);
+        s_.od[{0x606C, 0}] = raw32(selected);
+        s_.od[{0x60E5, 2}] = raw32(selected);
+        s_.od[{0x60E5, 3}] = raw32(encoder);
+    }
+
+    void advanceReset() {
+        if (s_.pendingResetReads < 0) return;
+        if (s_.pendingResetReads-- > 0) return;
+        s_.od[{0x6041, 0}] = 0x0240;
+        s_.od[{0x1001, 0}] = 0;
     }
 
     void applyControlword(uint16_t cw) {
+        const uint16_t previous = s_.lastControlword;
+        s_.lastControlword = cw;
         if (s_.ignoreControlword) return;
         auto& status = s_.od[{0x6041, 0}];
-        const bool faulted = (status & 0x4F) == 0x08;
-        if (faulted) {
-            if (cw & 0x80) {
-                status = 0x0240;
-                s_.od[{0x1001, 0}] = 0;
+        if ((status & 0x4F) == 0x08) {
+            // Fault: only a rising edge of bit 7 starts a reset.
+            if ((cw & 0x80) && !(previous & 0x80) && s_.pendingResetReads < 0) {
+                s_.pendingResetReads = s_.resetDelayReads;
             }
             return;
         }
@@ -127,7 +185,6 @@ private:
         case 0x00: status = 0x0240; break;
         default: break;
         }
-        updateVelocity();
     }
 
     FakeDriveState& s_;

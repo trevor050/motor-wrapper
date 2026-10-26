@@ -66,6 +66,11 @@ constexpr uint16_t kCwFaultReset = 0x0080;
 
 constexpr uint16_t kSwFaultBit = 0x0008;
 
+// Widen before taking the magnitude: std::abs(INT32_MIN) overflows.
+int64_t magnitude(int64_t value) {
+    return value < 0 ? -value : value;
+}
+
 std::string hex(uint16_t index, uint8_t subindex) {
     std::ostringstream out;
     out << "0x" << std::hex << std::uppercase << index << ':' << std::dec << unsigned(subindex);
@@ -147,6 +152,7 @@ DriveState Motor::state() {
 void Motor::waitForState(DriveState expected) {
     const auto deadline = std::chrono::steady_clock::now() + timing_.stateTimeout;
     while (true) {
+        throwIfCancelled(toString(expected));
         const auto status = statusword();
         if (status & kSwFaultBit) {
             throw MotorError(describe() + ": drive fault while waiting for " + toString(expected) + ".");
@@ -157,6 +163,12 @@ void Motor::waitForState(DriveState expected) {
                              + "; drive is in " + toString(decodeState(status)) + ".");
         }
         std::this_thread::sleep_for(timing_.pollInterval);
+    }
+}
+
+void Motor::throwIfCancelled(const char* step) {
+    if (cancelled_ && cancelled_()) {
+        throw MotorError(describe() + ": cancelled before " + step + ".");
     }
 }
 
@@ -240,6 +252,7 @@ void Motor::enable() {
     if (!commissioningVerified_) {
         throw MotorError(describe() + ": call verifyCommissioning() before enable().");
     }
+    throwIfCancelled("enable");
     const auto current = state();
     if (current == DriveState::Fault || current == DriveState::FaultReactionActive) {
         throw MotorError(describe() + ": drive is faulted; fix the cause, then call resetFault().");
@@ -253,19 +266,23 @@ void Motor::enable() {
     controlAttempted_ = true;
     try {
         write(kTargetVelocity, 0, 32);
-        lastTargetRpm_ = 0;
+        throwIfCancelled("mode change");
         write(kModesOfOperation, kModeProfileVelocity, 8);
         const auto deadline = std::chrono::steady_clock::now() + timing_.stateTimeout;
         while (read(kModesOfOperationDisplay) != kModeProfileVelocity) {
+            throwIfCancelled("Profile Velocity mode");
             if (std::chrono::steady_clock::now() >= deadline) {
                 throw MotorError(describe() + ": Profile Velocity mode was not acknowledged (0x6061).");
             }
             std::this_thread::sleep_for(timing_.pollInterval);
         }
+        throwIfCancelled("Shutdown command");
         controlword(kCwShutdown);
         waitForState(DriveState::ReadyToSwitchOn);
+        throwIfCancelled("Switch on command");
         controlword(kCwSwitchOn);
         waitForState(DriveState::SwitchedOn);
+        throwIfCancelled("Enable operation command");
         controlword(kCwEnableOperation);
         waitForState(DriveState::OperationEnabled);
     } catch (...) {
@@ -278,20 +295,19 @@ void Motor::enable() {
 void Motor::setVelocityRpm(int rpm) {
     if (!enabled_) throw MotorError(describe() + ": enable() the motor before setting a velocity.");
     const auto limit = std::min<int64_t>(limits_.maxRpm, profileVelocityLimitRpm_);
-    if (std::abs(rpm) > limit) {
+    if (magnitude(rpm) > limit) {
         throw MotorError(describe() + ": " + std::to_string(rpm) + " rpm exceeds the "
                          + std::to_string(limit) + " rpm limit.");
     }
     write(kTargetVelocity, rpm, 32);
-    lastTargetRpm_ = rpm;
 }
 
-bool Motor::stop() {
-    if (!controlAttempted_) return true;
+void Motor::commandZero() {
     write(kTargetVelocity, 0, 32);
-    lastTargetRpm_ = 0;
-    const auto deadline = std::chrono::steady_clock::now() + timing_.stopTimeout;
-    auto still = [&](int32_t rpm) { return std::abs(rpm) <= timing_.stationaryRpm; };
+}
+
+bool Motor::waitForStandstill(std::chrono::steady_clock::time_point deadline) {
+    auto still = [&](int64_t rpm) { return magnitude(rpm) <= timing_.stationaryRpm; };
     int stationary = 0;
     while (std::chrono::steady_clock::now() < deadline) {
         const bool stopped = still(readSigned32(kVelocityActual))
@@ -304,7 +320,15 @@ bool Motor::stop() {
     return false;
 }
 
+bool Motor::stop() {
+    // Always confirm with fresh readings, even if the drive is already
+    // disabled: a disabled motor can still be coasting.
+    commandZero();
+    return waitForStandstill(std::chrono::steady_clock::now() + timing_.stopTimeout);
+}
+
 void Motor::disable() {
+    enabled_ = false;
     controlword(kCwDisableVoltage);
     const auto deadline = std::chrono::steady_clock::now() + timing_.stateTimeout;
     while (true) {
@@ -317,7 +341,6 @@ void Motor::disable() {
         }
         std::this_thread::sleep_for(timing_.pollInterval);
     }
-    enabled_ = false;
     controlAttempted_ = false;
 }
 
@@ -334,15 +357,41 @@ void Motor::stopAndDisable() {
 }
 
 void Motor::bestEffortShutdown() noexcept {
-    try {
-        if (!stop()) std::cerr << describe() << ": standstill not confirmed before disable.\n";
-    } catch (const std::exception& error) {
-        std::cerr << describe() << ": stop failed: " << error.what() << '\n';
+    shutdownAll({this});
+}
+
+void shutdownAll(const std::vector<Motor*>& motors) noexcept {
+    // 1. Zero every target first so no motor keeps running while another one ramps down.
+    std::chrono::milliseconds longestStop{0};
+    for (auto* m : motors) {
+        if (!m || !m->needsShutdown()) continue;
+        longestStop = std::max(longestStop, m->timing().stopTimeout);
+        try {
+            m->commandZero();
+        } catch (const std::exception& error) {
+            std::cerr << m->describe() << ": zero command failed: " << error.what() << '\n';
+        }
     }
-    try {
-        disable();
-    } catch (const std::exception& error) {
-        std::cerr << describe() << ": DISABLE FAILED: " << error.what() << " Use the hardware stop.\n";
+    // 2. Wait for standstill on all of them against one shared deadline.
+    const auto deadline = std::chrono::steady_clock::now() + longestStop;
+    for (auto* m : motors) {
+        if (!m || !m->needsShutdown()) continue;
+        try {
+            if (!m->waitForStandstill(deadline)) {
+                std::cerr << m->describe() << ": standstill not confirmed before disable.\n";
+            }
+        } catch (const std::exception& error) {
+            std::cerr << m->describe() << ": standstill check failed: " << error.what() << '\n';
+        }
+    }
+    // 3. Disable every power stage, even where the stop was not confirmed.
+    for (auto* m : motors) {
+        if (!m || !m->needsShutdown()) continue;
+        try {
+            m->disable();
+        } catch (const std::exception& error) {
+            std::cerr << m->describe() << ": DISABLE FAILED: " << error.what() << " Use the hardware stop.\n";
+        }
     }
 }
 
@@ -351,11 +400,28 @@ void Motor::resetFault() {
     if (current != DriveState::Fault) {
         throw MotorError(describe() + ": resetFault() called, but the drive is in " + toString(current) + ".");
     }
-    // The reset triggers on the rising edge of bit 7.
+    // The reset triggers on the rising edge of bit 7, and the fault bit may
+    // stay set for a few polls while the drive processes it.
     controlword(0);
     controlword(kCwFaultReset);
-    waitForState(DriveState::SwitchOnDisabled);
+    bool cleared = false;
+    std::string problem;
+    try {
+        const auto deadline = std::chrono::steady_clock::now() + timing_.stateTimeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (state() == DriveState::SwitchOnDisabled) {
+                cleared = true;
+                break;
+            }
+            std::this_thread::sleep_for(timing_.pollInterval);
+        }
+    } catch (const std::exception& error) {
+        problem = error.what();
+    }
+    // Always release bit 7 so the next reset sees a fresh rising edge.
     controlword(0);
+    if (!problem.empty()) throw MotorError(describe() + ": fault reset failed: " + problem);
+    if (!cleared) throw MotorError(describe() + ": fault did not clear; check 0x1001 and the drive's error history.");
     enabled_ = false;
     controlAttempted_ = false;
 }
@@ -381,8 +447,16 @@ void Motor::checkHealthy() {
     try {
         const auto status = statusword();
         const auto current = decodeState(status);
-        const auto actual = readSigned32(kVelocityActual);
-        const int margin = limits_.overspeedMarginRpm;
+        const int64_t demand = readSigned32(kVelocityDemand);
+        const int64_t actual = readSigned32(kVelocityActual);
+        const int64_t encoder = readSigned32(kFeedbackVelocity, kFeedbackEncoder);
+        const int64_t margin = limits_.overspeedMarginRpm;
+        const int64_t overspeed = limits_.maxRpm + margin;
+        // Opposite signs with both magnitudes beyond the margin. Comparing
+        // against the ramp demand (not the target) allows normal reversals.
+        auto againstDemand = [&](int64_t velocity) {
+            return (demand > margin && velocity < -margin) || (demand < -margin && velocity > margin);
+        };
         if (status & kSwFaultBit) {
             problem = std::string("drive fault (") + toString(current) + ").";
         } else if (read(kErrorRegister) != 0) {
@@ -391,16 +465,28 @@ void Motor::checkHealthy() {
             problem = std::string("drive left Operation enabled; now ") + toString(current) + ".";
         } else if (enabled_ && read(kModesOfOperationDisplay) != kModeProfileVelocity) {
             problem = "operation mode changed unexpectedly.";
-        } else if (std::abs(actual) > limits_.maxRpm + margin) {
-            problem = "overspeed: " + std::to_string(actual) + " rpm.";
-        } else if ((lastTargetRpm_ > 0 && actual < -margin) || (lastTargetRpm_ < 0 && actual > margin)) {
-            problem = "moving opposite to the commanded direction (" + std::to_string(actual) + " rpm).";
+        } else if (magnitude(actual) > overspeed || magnitude(encoder) > overspeed) {
+            problem = "overspeed: selected " + std::to_string(actual) + " rpm, encoder "
+                + std::to_string(encoder) + " rpm.";
+        } else if (againstDemand(actual) || againstDemand(encoder)) {
+            problem = "moving opposite to the demanded direction (demand " + std::to_string(demand)
+                + ", selected " + std::to_string(actual) + ", encoder " + std::to_string(encoder) + " rpm).";
         }
     } catch (const std::exception& error) {
         problem = std::string("health check read failed: ") + error.what();
     }
     if (problem.empty()) return;
-    if (controlAttempted_) bestEffortShutdown();
+    // Trip: zero the target right away and refuse new targets. The blocking
+    // wait and disable are left to stopAndDisable()/shutdownAll() so other
+    // motors can be zeroed promptly too.
+    enabled_ = false;
+    if (controlAttempted_) {
+        try {
+            commandZero();
+        } catch (const std::exception& error) {
+            problem += std::string(" Zero command also failed: ") + error.what();
+        }
+    }
     throw MotorError(describe() + ": " + problem);
 }
 
